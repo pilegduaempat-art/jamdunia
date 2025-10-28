@@ -1,5 +1,5 @@
 """
-Streamlit World Clock Dashboard + Telegram /check command + Alarm feature
+Streamlit World Clock Dashboard + Telegram /check command
 File: streamlit_world_clock_bot.py
 
 Features:
@@ -7,11 +7,10 @@ Features:
 - Choose built-in cities or add custom timezone (IANA tz name) or custom city name
 - Optional auto-refresh (uses streamlit-autorefresh if installed) with fallback manual Refresh button
 - Telegram bot integration (python-telegram-bot). Handles /check to reply current times for configured zones
-- Alarm system: users can set alarms per timezone; when alarm time is reached, app plays a beep sound and highlights alarm.
 
 How to run:
 1) Install dependencies:
-   pip install streamlit pytz python-telegram-bot==13.15 tzdata simpleaudio
+   pip install streamlit pytz python-telegram-bot==13.15 tzdata
    # optional auto-refresh dependency:
    pip install streamlit-autorefresh
 
@@ -21,21 +20,21 @@ How to run:
 
 3) Run streamlit app:
    streamlit run streamlit_world_clock_bot.py
+
+Notes:
+- For Telegram the script will start a polling updater in a background thread; ensure the process can run continuously.
+- If you wish to disable the Telegram part, set TELEGRAM_TOKEN to empty or run with --no-telegram
+
 """
 
 import os
 import threading
 import time
 from datetime import datetime
+from typing import List, Dict
+
 import pytz
 import streamlit as st
-
-# optional for playing beep
-try:
-    import simpleaudio as sa
-    SIMPLEAUDIO_AVAILABLE = True
-except Exception:
-    SIMPLEAUDIO_AVAILABLE = False
 
 # Telegram imports (optional)
 try:
@@ -45,6 +44,7 @@ try:
 except Exception:
     TELEGRAM_AVAILABLE = False
 
+# --- Configuration ---
 DEFAULT_CITIES = {
     "WIB (Jakarta)": "Asia/Jakarta",
     "Tokyo": "Asia/Tokyo",
@@ -62,50 +62,30 @@ def get_time_for_tz(tz_name: str) -> datetime:
     tz = pytz.timezone(tz_name)
     return datetime.now(tz)
 
+
 def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
+
 
 def format_date(dt: datetime) -> str:
     return dt.strftime("%A, %d %B %Y")
 
-def build_times_dict(timezones):
+
+def build_times_dict(timezones: Dict[str, str]) -> Dict[str, Dict[str, str]]:
     out = {}
     for label, tz in timezones.items():
         try:
             dt = get_time_for_tz(tz)
-            out[label] = {"time": format_time(dt), "date": format_date(dt)}
+            out[label] = {"time": format_time(dt), "date": format_date(dt), "iso": dt.isoformat()}
         except Exception as e:
-            out[label] = {"time": "Invalid TZ", "date": str(e)}
+            out[label] = {"time": "Invalid TZ", "date": str(e), "iso": ""}
     return out
 
-# --- Alarm logic ---
-ALARMS = []  # list of dicts: {label, timezone, time_str}
+# --- Telegram bot: command handlers ---
 
-def play_beep():
-    if not SIMPLEAUDIO_AVAILABLE:
-        print("Beep!")
-        return
-    import numpy as np
-    fs = 44100
-    f = 880.0
-    duration = 0.5
-    samples = (np.sin(2 * np.pi * np.arange(fs * duration) * f / fs)).astype(np.float32)
-    sa.play_buffer((samples * 32767).astype(np.int16), 1, 2, fs)
-
-def check_alarms():
-    triggered = []
-    for alarm in ALARMS:
-        dt_now = get_time_for_tz(alarm["timezone"])
-        current_hm = dt_now.strftime("%H:%M")
-        if current_hm == alarm["time_str"]:
-            triggered.append(alarm)
-    return triggered
-
-# --- Telegram bot ---
-
-def start_telegram_bot(token: str, tracked_timezones):
+def start_telegram_bot(token: str, tracked_timezones: Dict[str, str]):
     if not TELEGRAM_AVAILABLE:
-        st.warning("python-telegram-bot not available. Telegram disabled.")
+        st.warning("python-telegram-bot not available. Telegram features disabled.")
         return None
 
     updater = Updater(token=token, use_context=True)
@@ -119,13 +99,19 @@ def start_telegram_bot(token: str, tracked_timezones):
         text = "\n".join(lines)
         update.message.reply_text(text)
 
-    dispatcher.add_handler(CommandHandler("check", check_command))
+    def start_cmd(update: Update, context: CallbackContext):
+        update.message.reply_text("World Clock Bot active. Use /check to get the current times.")
 
+    dispatcher.add_handler(CommandHandler("check", check_command))
+    dispatcher.add_handler(CommandHandler("start", start_cmd))
+
+    # run polling in background thread so Streamlit UI remains responsive
     def polling():
         updater.start_polling()
         updater.idle()
 
-    threading.Thread(target=polling, daemon=True).start()
+    t = threading.Thread(target=polling, daemon=True)
+    t.start()
     return updater
 
 # --- Streamlit UI ---
@@ -134,47 +120,108 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
-    selection = st.sidebar.multiselect("Select cities to show", options=list(DEFAULT_CITIES.keys()), default=list(DEFAULT_CITIES.keys()))
+    # Sidebar controls
+    st.sidebar.header("Settings")
 
-    custom_label = st.sidebar.text_input("Custom city label")
-    custom_tz = st.sidebar.text_input("Custom timezone (e.g. Europe/Berlin)")
-    if st.sidebar.button("Add timezone"):
+    # Choose which cities/timezones to show
+    available = list(DEFAULT_CITIES.keys())
+    default_selection = list(DEFAULT_CITIES.keys())
+    selection = st.sidebar.multiselect("Select cities to show", options=available, default=default_selection)
+
+    # Add custom timezone entries
+    st.sidebar.markdown("---")
+    custom_label = st.sidebar.text_input("Custom city label (optional)")
+    custom_tz = st.sidebar.text_input("Custom IANA timezone (e.g. Europe/Berlin)")
+    add_btn = st.sidebar.button("Add custom timezone")
+
+    # Auto-refresh option
+    st.sidebar.markdown("---")
+    st.sidebar.write("Auto-refresh options")
+    auto_refresh_enabled = st.sidebar.checkbox("Enable auto-refresh (uses streamlit-autorefresh if available)", value=True)
+    refresh_seconds = st.sidebar.number_input("Refresh every (seconds)", min_value=1, max_value=3600, value=1)
+
+    # Telegram config
+    st.sidebar.markdown("---")
+    st.sidebar.header("Telegram integration")
+    token_env = os.getenv("TELEGRAM_TOKEN", "")
+    token = st.sidebar.text_input("Telegram Bot Token", value=token_env, type="password")
+    start_telegram = st.sidebar.button("Start/Restart Telegram bot")
+    no_telegram = st.sidebar.checkbox("Disable Telegram features", value=(token == ""))
+
+    # allow adding custom timezone
+    if add_btn and custom_tz.strip() != "":
         try:
-            pytz.timezone(custom_tz)
-            DEFAULT_CITIES[custom_label or custom_tz] = custom_tz
-            st.sidebar.success(f"Added {custom_label}")
+            pytz.timezone(custom_tz.strip())
+            key = custom_label.strip() or custom_tz.strip()
+            DEFAULT_CITIES[key] = custom_tz.strip()
+            st.sidebar.success(f"Added {key} -> {custom_tz}")
         except Exception:
-            st.sidebar.error("Invalid timezone")
+            st.sidebar.error("Invalid timezone. Use IANA timezone names (e.g. Europe/Berlin)")
 
-    # Alarm settings
-    st.sidebar.header("Alarm settings")
-    alarm_city = st.sidebar.selectbox("Select timezone for alarm", options=list(DEFAULT_CITIES.keys()))
-    alarm_time = st.sidebar.text_input("Set alarm (HH:MM, 24h format)")
-    if st.sidebar.button("Add Alarm") and alarm_time:
-        ALARMS.append({"label": alarm_city, "timezone": DEFAULT_CITIES[alarm_city], "time_str": alarm_time})
-        st.sidebar.success(f"Alarm set for {alarm_city} at {alarm_time}")
+    # Build timezones to display
+    timezones_to_display = {k: DEFAULT_CITIES[k] for k in selection}
 
-    st.sidebar.write("Active alarms:")
-    for a in ALARMS:
-        st.sidebar.text(f"{a['label']} @ {a['time_str']}")
+    # Telegram start
+    if start_telegram and not no_telegram:
+        if token.strip() == "":
+            st.sidebar.error("Provide TELEGRAM_TOKEN to start the bot.")
+        else:
+            st.sidebar.info("Starting Telegram bot (polling)...")
+            start_telegram_bot(token.strip(), timezones_to_display)
 
-    # Telegram
-    token = os.getenv("TELEGRAM_TOKEN", "")
-    if token and st.sidebar.button("Start Telegram Bot"):
-        start_telegram_bot(token, {k: DEFAULT_CITIES[k] for k in selection})
+    # Optionally start automatically if TELEGRAM_TOKEN env var exists and not disabled
+    if token_env and not no_telegram and token.strip() == "":
+        # start with env token
+        token = token_env
+        start_telegram_bot(token, timezones_to_display)
 
-    times = build_times_dict({k: DEFAULT_CITIES[k] for k in selection})
+    # Build times
+    times = build_times_dict(timezones_to_display)
 
-    triggered = check_alarms()
-    if triggered:
-        for alarm in triggered:
-            st.error(f"⏰ Alarm for {alarm['label']} ({alarm['time_str']})!")
-            play_beep()
+    # Attempt to auto-refresh using streamlit-autorefresh if installed
+    did_autorefresh = False
+    if auto_refresh_enabled:
+        try:
+            # streamlit-autorefresh is an optional package that provides st_autorefresh
+            from streamlit_autorefresh import st_autorefresh
 
-    cols = st.columns(4)
+            st_autorefresh(interval=refresh_seconds * 1000, key="world_clock_autorefresh")
+            did_autorefresh = True
+        except Exception:
+            # package not available; fall back to manual refresh button below
+            did_autorefresh = False
+
+    # Layout: big clock + grid
+    cols = st.columns([2, 1])
+    main_col = cols[0]
+    side_col = cols[1]
+
+    # Show big clock for the first selected city (or UTC fallback)
+    if len(times) > 0:
+        main_label = list(times.keys())[0]
+        main_info = times[main_label]
+    else:
+        main_label = "UTC"
+        main_info = build_times_dict({"UTC": "UTC"})["UTC"]
+
+    with main_col:
+        st.markdown(f"<div style='font-size:140px; font-weight:700; line-height:0.9'>{main_info['time']}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:20px; color:gray'>{main_label} — {main_info['date']}</div>", unsafe_allow_html=True)
+
+    # Right column: list current times
+    with side_col:
+        st.subheader("Current times")
+        for label, info in times.items():
+            st.markdown(f"**{label}** — {info['time']}  ")
+
+    st.markdown("---")
+    st.subheader("All locations")
+
+    # Grid display
+    grid_cols = st.columns(4)
     idx = 0
     for label, info in times.items():
-        with cols[idx % 4]:
+        with grid_cols[idx % 4]:
             st.markdown(f"<div style='padding:12px; border-radius:8px; background:#f5f5f5'>", unsafe_allow_html=True)
             st.markdown(f"<div style='font-size:28px; font-weight:600'>{label}</div>", unsafe_allow_html=True)
             st.markdown(f"<div style='font-size:22px'>{info['time']}</div>", unsafe_allow_html=True)
@@ -182,8 +229,16 @@ def main():
             st.markdown("</div>", unsafe_allow_html=True)
         idx += 1
 
-    if st.button("Refresh"):
-        st.experimental_rerun()
+    st.markdown("---")
+    # Manual refresh fallback
+    if not did_autorefresh:
+        if st.button("Refresh"):
+            st.experimental_rerun()
+
+    # Expose a quick /check response text box so user can copy-paste or test
+    st.info("Telegram command /check will reply with the current times for configured cities when Telegram bot is running.")
+    st.text_area("Sample /check response (preview)", value="\n".join([f"{k}: {v['time']} ({v['date']})" for k, v in times.items()]), height=200)
+
 
 if __name__ == '__main__':
     main()
