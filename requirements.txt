@@ -1,0 +1,9 @@
+# Streamlit World Clock Dashboard + Telegram + Alarm
+streamlit==1.39.0
+pytz
+tzdata
+python-telegram-bot==13.15
+simpleaudio
+numpy
+# optional for auto-refresh
+streamlit-autorefresh
